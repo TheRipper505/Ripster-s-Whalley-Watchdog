@@ -1,3 +1,6 @@
+<p align="center">
+  <img src="./Ripsters_Whalley_Watchdog_Logo.png" alt="Ripster's Whalley Watchdog" width="300">
+</p>
 # Ripster’s Whalley Watchdog
 
 **Version 1.1 · November 2026**  
