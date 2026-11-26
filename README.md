@@ -1,6 +1,27 @@
 <p align="center">
   <img src="./Ripsters_Whalley_Watchdog_Logo.png" alt="Ripster's Whalley Watchdog" width="300">
 </p>
+<p align="center">
+  <a href="../../releases/latest">
+    <img src="https://img.shields.io/github/v/release/TheRipper505/Ripster-s-Whalley-Watchdog?color=blue&label=Release" alt="Latest Release">
+  </a>
+  <a href="./LICENSE">
+    <img src="https://img.shields.io/badge/License-MIT-green" alt="MIT License">
+  </a>
+  <img src="https://img.shields.io/badge/Cloudflare-Free%20Tier-orange" alt="Cloudflare Free Tier">
+  <a href="https://www.virustotal.com/gui/file/d5eb872a9d4e2176fbf6453359a69eaa4e8c92e6a18f3868aeea0560ccb95de2/">
+    <img src="https://img.shields.io/badge/VirusTotal-View%20Report-blue" alt="VirusTotal Report">
+  </a>
+  <a href="../../releases">
+    <img src="https://img.shields.io/github/downloads/TheRipper505/Ripster-s-Whalley-Watchdog/total?label=Downloads" alt="Downloads">
+  </a>
+</p>
+
+<p align="center">
+  <a href="../../releases/latest">
+    <img src="https://img.shields.io/badge/DOWNLOAD-WHALLY_WATCHDOG-B22222?style=for-the-badge&logo=github&logoColor=white" alt="Download Whalley Watchdog">
+  </a>
+</p>
 
 # Ripster’s Whalley Watchdog
 
@@ -8,6 +29,10 @@
 **Free. Independent. Automatic.**
 
 Ripster’s Whalley Watchdog monitors WhalleyBot V3 every minute and automatically restarts it after two consecutive offline readings. It runs independently on Cloudflare Workers and D1, designed to operate within Cloudflare’s free tier. No additional computer, paid hosting, local software installation or modifications to your SCUM server are required.
+
+<p align="center">
+  <img src="./Watchdog_Discord_Preview.png" alt="Live Whalley Watchdog Discord status dashboard" width="500">
+</p>
 
 ## Features
 
