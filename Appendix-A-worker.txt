@@ -1,0 +1,200 @@
+const BASE = 'https://panel.whalleybot.com';
+const MIN = 60000;
+const fail = code => { throw new Error(code); };
+const knownErrors = new Set(['LOGIN_PAGE','LOGIN_TOKEN','LOGIN_REJECTED','CONSOLE_PAGE','CONSOLE_TOKEN','AUTH_REQUIRED','HTTP_STATUS','INVALID_STATUS','START_REJECTED','NETWORK','CONFIG','LOCK_LOST']);
+function errorCode(e) { return knownErrors.has(e.message) ? e.message : 'UNEXPECTED'; }
+class Session {
+  constructor(saved = {}) { this.cookies = saved.cookies || {}; this.csrf = saved.csrf || ''; }
+  async request(path, options = {}) {
+    const headers = new Headers(options.headers);
+    if (!headers.has('Accept')) headers.set('Accept','application/json');
+    const cookie = Object.entries(this.cookies).filter(([,v]) => v.expires > Date.now()).map(([k,v]) => `${k}=${v.value}`).join('; ');
+    if (cookie) headers.set('Cookie',cookie);
+    if (this.csrf) headers.set('X-CSRF-Token',this.csrf);
+    let r;
+    try { r = await fetch(BASE+path,{...options,headers,redirect:'manual',signal:AbortSignal.timeout(10000)}); } catch { fail('NETWORK'); }
+    for (const line of r.headers.getSetCookie()) {
+      const [pair,...attrs] = line.split(';'); const i = pair.indexOf('='); if(i<1) continue;
+      const name=pair.slice(0,i).trim(); if(!['PHPSESSID','XSRF-TOKEN','panel2_runtime_session'].includes(name)) continue;
+      const value=pair.slice(i+1); let expires=Date.now()+7200000;
+      const max=attrs.find(a=>/^\s*max-age=/i.test(a)); const exp=attrs.find(a=>/^\s*expires=/i.test(a));
+      if(max) expires=Date.now()+Number(max.split('=')[1])*1000; else if(exp) expires=Date.parse(exp.slice(exp.indexOf('=')+1));
+      if(!value || !(expires>Date.now())) delete this.cookies[name]; else this.cookies[name]={value,expires};
+    }
+    return r;
+  }
+  async token(response, selector, attribute) {
+    let token=''; await new HTMLRewriter().on(selector,{element(e){token=e.getAttribute(attribute)||'';}}).transform(response).text(); return token;
+  }
+  async login(env,path) {
+    this.cookies={}; this.csrf='';
+    const page=await this.request('/login',{headers:{Accept:'text/html'}}); if(!page.ok) fail('LOGIN_PAGE');
+    const token=await this.token(page,'input[name="_token"]','value'); if(!token) fail('LOGIN_TOKEN');
+    const r=await this.request('/login',{method:'POST',headers:{Accept:'text/html','Content-Type':'application/x-www-form-urlencoded',Origin:BASE,Referer:BASE+'/login'},body:new URLSearchParams({_token:token,login:env.WHALLEY_LOGIN,password:env.WHALLEY_PASSWORD})});
+    if(![302,303].includes(r.status)) fail('LOGIN_REJECTED'); await r.body?.cancel();
+    const consolePage=await this.request(path,{headers:{Accept:'text/html'}}); if(!consolePage.ok) fail('CONSOLE_PAGE');
+    this.csrf=await this.token(consolePage,'meta[name="csrf-token"]','content'); if(!this.csrf) fail('CONSOLE_TOKEN');
+  }
+  async status(path) {
+    const r=await this.request(path+'/resources');
+    if([301,302,303,307,308,401,403,419].includes(r.status)) fail('AUTH_REQUIRED');
+    if(!r.ok) fail('HTTP_STATUS');
+    let d; try { d=await r.json(); } catch { fail('INVALID_STATUS'); }
+    return parseStatus(d);
+  }
+  async start(path) {
+    const r=await this.request(path+'/power',{method:'POST',headers:{'Content-Type':'application/json',Origin:BASE,Referer:BASE+path},body:JSON.stringify({signal:'start'})});
+    if(!r.ok) fail('START_REJECTED'); const d=await r.json(); if(d.available!==true) fail('START_REJECTED');
+  }
+}
+export function parseStatus(d) {
+  const p=d?.payload ?? d; const r=p?.resources;
+  if(d?.available===false || typeof p?.state!=='string' || typeof r?.current_state!=='string' || typeof r?.is_suspended!=='boolean') fail('INVALID_STATUS');
+  return {state:p.state,current:r.current_state,suspended:r.is_suspended};
+}
+export function decide(s,status,now,enabled) {
+  s.attempts=(s.attempts||[]).filter(t=>now-t<60*MIN);
+  if(status.suspended || status.state!==status.current || !['offline','stopped'].includes(status.state)) {s.failures=0; return false;}
+  s.failures=(now-s.lastFailure<=2.5*MIN ? (s.failures||0):0)+1; s.lastFailure=now;
+  if(!enabled || s.failures<2 || s.attempts.length>=3 || now-(s.lastAttempt||0)<2*MIN) return false;
+  s.attempts.push(now); s.lastAttempt=now; s.failures=0; s.pending=true; return true;
+}
+async function run(env) {
+  if(env.WATCHDOG_ENABLED!=='true') return;
+  if(!/^[a-f0-9]{8}$/.test(env.WHALLEY_BOT_ID)||!env.WHALLEY_LOGIN||!env.WHALLEY_PASSWORD) fail('CONFIG');
+  const db=env.WATCHDOG_STATE, owner=crypto.randomUUID(), now=Date.now(), path=`/bots/${env.WHALLEY_BOT_ID}/console`;
+  const lock=await db.prepare(`INSERT INTO watchdog_state(key,value,updated_at) VALUES('lock',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at WHERE watchdog_state.updated_at < ?`).bind(owner,now+5*MIN,now).run();
+  if(lock.meta.changes!==1) return;
+  let s={}; let session; let observed; const events=[];
+  const save=async()=>{const r=await db.prepare(`INSERT INTO watchdog_state(key,value,updated_at) SELECT 'runtime',?,? WHERE EXISTS(SELECT 1 FROM watchdog_state WHERE key='lock' AND value=? AND updated_at>?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`).bind(JSON.stringify(s),Date.now(),owner,Date.now()).run(); if(r.meta.changes!==1) fail('LOCK_LOST');};
+  const log=async(event,details={})=>{events.push(event); console.log(JSON.stringify({event,...details})); if(event!=='STATUS') await db.prepare('INSERT INTO watchdog_events(timestamp,event,details) VALUES(?,?,?)').bind(Date.now(),event,JSON.stringify(details)).run();};
+  try {
+    const row=await db.prepare("SELECT value FROM watchdog_state WHERE key='runtime'").first(); s=row?JSON.parse(row.value):{};
+    session=new Session(s.session);
+    if(!session.csrf || !Object.keys(session.cookies).length) {if(Date.now()<(s.authRetry||0)) return; s.authRetry=Date.now()+5*MIN; await save(); await session.login(env,path);}
+    let status;
+    try {status=await session.status(path);} catch(e) {if(e.message!=='AUTH_REQUIRED') throw e; s.session=null; if(Date.now()<(s.authRetry||0)) throw e; s.authRetry=Date.now()+5*MIN; await save(); await session.login(env,path); status=await session.status(path);}
+    s.session={cookies:session.cookies,csrf:session.csrf}; s.authRetry=0;
+    observed=status; await log('STATUS',status);
+    if(status.state==='running' && status.current==='running' && !status.suspended && s.pending){s.pending=false; await log('RECOVERY_VERIFIED');}
+    const start=decide(s,status,Date.now(),env.RECOVERY_ENABLED==='true'); await save();
+    if(start){await log('RECOVERY_ATTEMPT'); await session.start(path); s.session={cookies:session.cookies,csrf:session.csrf}; await save(); await log('START_ACCEPTED');}
+  } catch(e) {s.failures=0; if(session && ['AUTH_REQUIRED','LOGIN_PAGE','LOGIN_TOKEN','LOGIN_REJECTED','CONSOLE_PAGE','CONSOLE_TOKEN'].includes(e.message)) s.session=null; await save(); await log('WATCHDOG_ERROR',{reason:errorCode(e)});}
+  finally {try { await telemetry(env,observed,events,s,now); } catch(e) { console.log('REPORTING_ERROR', /D1|SQLITE/i.test(String(e?.message))?'DATABASE':'UNEXPECTED'); } await db.prepare("DELETE FROM watchdog_state WHERE key='lock' AND value=?").bind(owner).run();}
+}
+export default {fetch(){return new Response('Not Found',{status:404});},async scheduled(controller,env,ctx){ctx.waitUntil(run(env));}};
+// Discord and reporting are isolated from the recovery decision.
+const HOUR=60, DAY=1440;
+const BRAND='Ripster’s Whalley Watchdog';
+const REPO='https://github.com/TheRipper505/Ripster-s-Whalley-Watchdog';
+const LOGO='https://raw.githubusercontent.com/TheRipper505/Ripster-s-Whalley-Watchdog/main/Ripsters_Whalley_Watchdog_Logo.png';
+function duration(ms){if(ms==null)return 'N/A';const n=Math.max(0,Math.floor(ms/1000));return [Math.floor(n/86400)&&Math.floor(n/86400)+'d',Math.floor(n/3600)%24&&Math.floor(n/3600)%24+'h',Math.floor(n/60)%60&&Math.floor(n/60)%60+'m',(n%60||!n)?n%60+'s':''].filter(Boolean).join(' ');}
+
+function classification(st){return !st?'unknown':st.suspended?'suspended':st.state===st.current&&st.state==='running'?'online':st.state===st.current&&['offline','stopped'].includes(st.state)?'offline':'unknown';}
+const counts=['online','offline','unknown','suspended'];
+async function record(db,m,status){
+  const h=Math.floor(m/HOUR)*HOUR,d=Math.floor(m/DAY)*DAY;
+  // Atomic, idempotent minute observation and rollups; duplicate minutes do not increment totals.
+  const cols=counts.map(x=>x+'_minutes');
+  
+  const stmts=[db.prepare('INSERT OR IGNORE INTO watchdog_observations(minute,status) VALUES(?,?)').bind(m,status)];
+  for(const [table,key,bucket] of [['watchdog_hourly','hour',h],['watchdog_daily','day',d]]){
+    // Recompute the bucket from its authoritative lower-granularity records.
+    const src=key==='hour'?'watchdog_observations':'watchdog_hourly', k=key==='hour'?'minute':'hour';
+    const sums=key==='hour'?counts.map(x=>`SUM(status='${x}')`):cols.map(x=>`SUM(${x})`);
+    stmts.push(db.prepare(`INSERT INTO ${table}(${key},${cols.join(',')}) SELECT ?,${sums.join(',')} FROM ${src} WHERE ${k}>=? AND ${k}<? ON CONFLICT(${key}) DO UPDATE SET ${cols.map(x=>`${x}=excluded.${x}`).join(',')}`).bind(bucket,bucket,bucket+(key==='hour'?HOUR:DAY)));
+  }
+  if(m%60<5){stmts.push(db.prepare('DELETE FROM watchdog_observations WHERE minute<?').bind(m-31*DAY),db.prepare('DELETE FROM watchdog_hourly WHERE hour<?').bind(h-32*DAY));}
+  await db.batch(stmts);
+}
+function webhook(raw){if(!raw)return null; const u=new URL(raw);if(u.origin!=='https://discord.com'||u.search||u.hash||u.username||u.password||!/^\/api\/webhooks\/\d{17,20}\/[\w-]+$/.test(u.pathname))throw Error('WEBHOOK_CONFIG');return u.origin+u.pathname;}
+async function discord(url,method='GET',body){
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(),5000);
+  try {
+    let r;
+    try { r=await fetch(url,{method,redirect:'manual',signal:controller.signal,headers:{'Content-Type':'application/json'},...(body?{body:JSON.stringify(body)}:{})}); }
+    catch(e) { const msg=String(e?.message||''); const kind=controller.signal.aborted?'TIMEOUT':/redirect/i.test(msg)?'REDIRECT':/subrequest/i.test(msg)?'SUBREQUEST_LIMIT':/dns/i.test(msg)?'DNS':/tls|ssl|certificate/i.test(msg)?'TLS':/network|fetch|connect/i.test(msg)?'NETWORK':'OTHER'; console.log('DISCORD_TRANSPORT_'+kind); throw Error('DISCORD_TRANSPORT'); }
+    if(r.status>=300&&r.status<400){console.log('DISCORD_REDIRECT_'+r.status);throw Error('DISCORD_REDIRECT');}
+    if(r.status===429){let delay=60;try{delay=Number((await r.json()).retry_after)||60;}catch{};return {retry:Date.now()+Math.max(1,delay)*1000};}
+    if(r.status===404){console.log('DISCORD_HTTP_404');return {missing:true};}
+    if(!r.ok){console.log('DISCORD_HTTP_'+r.status);throw Error('DISCORD_HTTP');}
+    return r.status===204?{}:await r.json();
+  } finally { clearTimeout(timer); }
+}
+async function report(db,m,firstMinute){
+  const cols=counts.map(x=>x+'_minutes');const end=m+1;
+  const result=[];
+  for(const [label,days] of [['24h',1],['7d',7],['30d',30],['Lifetime',0]]){
+    // Completed/current UTC hourly buckets for rolling windows; lifetime uses daily totals.
+    const start=days?end-days*DAY:0; const boundary=days?Math.ceil(start/60)*60:0;
+    const table=days?'watchdog_hourly':'watchdog_daily',key=days?'hour':'day';
+    const r=await db.prepare(`SELECT MIN(${key}) AS first,${cols.map(x=>`COALESCE(SUM(${x}),0) AS ${x}`).join(',')} FROM ${table} WHERE ${key}>=?`).bind(boundary).first();
+    if(days&&boundary>start){const edge=await db.prepare(`SELECT ${counts.map(x=>`COALESCE(SUM(status='${x}'),0) AS ${x}_minutes`).join(',')} FROM watchdog_observations WHERE minute>=? AND minute<?`).bind(start,boundary).first();for(const c of cols)r[c]+=edge[c];}
+    const i=await db.prepare('SELECT COUNT(*) AS outages, COALESCE(SUM(automatically_recovered),0) AS recovered FROM watchdog_incidents WHERE started_at>=?').bind(start*MIN).first();
+    const known=r.online_minutes+r.offline_minutes+r.suspended_minutes;
+    const span=end-Math.max(start,firstMinute);
+    result.push({label,known,span,online:r.online_minutes,outages:i.outages,recovered:i.recovered});
+  }return result;
+}
+async function telemetry(env,st,events,s,now){
+  const db=env.WATCHDOG_STATE,m=Math.floor(now/MIN),status=classification(st),recovery=env.RECOVERY_ENABLED==='true';
+  await record(db,m,status);
+  const row=await db.prepare("SELECT value FROM watchdog_discord WHERE key='runtime'").first();const t=row?JSON.parse(row.value):{};
+  const save=()=>db.prepare("INSERT INTO watchdog_discord(key,value,updated_at) VALUES('runtime',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at").bind(JSON.stringify(t),Date.now()).run();
+  const notices=[]; const add=(text,critical=false)=>notices.push({text,critical});
+  const consecutive=t.minute===m-1;
+  if(t.minute===m)return;
+  if(t.firstMinute===undefined)t.firstMinute=m;
+  t.offline=status==='offline'?(consecutive?(t.offline||0):0)+1:0;
+  t.errors=status==='unknown'?(consecutive?(t.errors||0):0)+1:0;
+  if(t.offline>=2&&!t.incident){const r=await db.prepare('INSERT INTO watchdog_incidents(started_at) VALUES(?) RETURNING id').bind((m-1)*MIN).first();t.incident=r.id;add('WhalleyBot outage confirmed.');}
+  if(t.incident&&events.includes('RECOVERY_ATTEMPT')){await db.prepare('UPDATE watchdog_incidents SET recovery_attempts=recovery_attempts+1 WHERE id=?').bind(t.incident).run();add('Automatic recovery attempted.');}
+  if(t.incident&&events.includes('RECOVERY_ATTEMPT')&&!events.includes('START_ACCEPTED')){await db.prepare('UPDATE watchdog_incidents SET recovery_failures=recovery_failures+1 WHERE id=?').bind(t.incident).run();add('Automatic recovery request failed.');}
+  if(t.incident&&status==='online'){const auto=events.includes('RECOVERY_VERIFIED');await db.prepare('UPDATE watchdog_incidents SET ended_at=?,automatically_recovered=? WHERE id=?').bind(now,Number(auto),t.incident).run();delete t.incident;t.exhausted=false;add(auto?'WhalleyBot automatically recovered.':'WhalleyBot is online again.');}
+  if(t.incident&&status==='offline'&&recovery&&(s.attempts||[]).length>=3&&!t.exhausted&&!events.includes('START_ACCEPTED')){t.exhausted=true;add('Recovery limit reached; administrator intervention may be required.',true);}
+  if(t.errors>=3&&!t.errorAlert){t.errorAlert=true;add('Monitoring unavailable for three consecutive checks.',true);}
+  if(status!=='unknown'&&t.errorAlert){t.errorAlert=false;add('Monitoring restored.');}
+  if(status==='suspended'&&t.status!=='suspended')add('WhalleyBot is suspended.',true);
+  if(t.recovery!==undefined&&t.recovery!==recovery)add(recovery?'Automatic recovery enabled.':'Automatic recovery disabled.');
+  if(status==='online'&&(!consecutive||t.status!=='online'))t.onlineSince=m;
+  const display=status==='online'&&!recovery?'monitoring':status==='offline'?(t.offline<2?'verifying':t.exhausted&&recovery?'intervention':events.includes('START_ACCEPTED')?'recovering':'offline'):status;
+  const changed=t.display!==display||t.recovery!==recovery;
+  Object.assign(t,{minute:m,status,display,recovery});
+  if(env.DISCORD_ADMIN_WEBHOOK_URL){t.queue=[...(t.queue||[]),...notices].slice(-100);}else delete t.queue;
+  await save();
+  // Resolve actual channel IDs, never names. Fail closed for admin routing if public destination cannot be verified.
+  let pub,admin;try{pub=webhook(env.DISCORD_STATUS_WEBHOOK_URL);admin=webhook(env.DISCORD_ADMIN_WEBHOOK_URL);}catch{console.log('DISCORD_CONFIG_ERROR');return;}
+  const identify=async(url,key)=>{if(!url)return null;const id=url.split('/')[5];let x=t[key];if(!x||x.id!==id||m-(x.checked||0)>=60||notices.length>0){const r=await discord(url);if(r.retry){t[key==='publicDestination'?'publicRetry':'adminRetry']=r.retry;return null;}if(!r.channel_id)return null;x={id,channel:r.channel_id,checked:m};t[key]=x;}return x;};
+  let p,a;try{if(Date.now()>=(t.publicRetry||0))p=await identify(pub,'publicDestination');}catch{console.log('DISCORD_STATUS_ERROR');}
+  try{if(Date.now()>=(t.adminRetry||0))a=await identify(admin,'adminDestination');}catch{console.log('DISCORD_ADMIN_ERROR');}
+  if(a&&(!pub||(p&&p.channel!==a.channel))&&t.queue?.length){try{
+    const batch=t.queue.slice(0,10), role=/^\d{17,20}$/.test(env.DISCORD_ADMIN_ROLE_ID||'')?env.DISCORD_ADMIN_ROLE_ID:null;
+    const mention=role&&batch.some(n=>n.critical);
+    const r=await discord(admin+'?wait=true','POST',{username:BRAND,avatar_url:LOGO,content:(mention?`<@&${role}>\n`:'')+batch.map(n=>n.text).join('\n'),allowed_mentions:{parse:[],roles:mention?[role]:[]}});
+    if(r.retry)t.adminRetry=r.retry;else if(r.id){t.queue.splice(0,batch.length);await save();}
+  }catch{console.log('DISCORD_ADMIN_ERROR');}}
+
+  if(p&&(changed||t.publishedDisplay!==display||!t.message||m-(t.published||0)>=5||t.messageWebhook!==p.id)){try{
+    const metrics=await report(db,m,t.firstMinute);
+    const history=await db.prepare(`SELECT MAX(started_at) AS last_outage, AVG(CASE WHEN automatically_recovered=1 THEN ended_at-started_at END) AS avg_recovery FROM watchdog_incidents`).first();
+    const last=await db.prepare('SELECT ended_at-started_at AS elapsed FROM watchdog_incidents WHERE automatically_recovered=1 AND ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT 1').first();
+    const body=card(display,status,recovery,m,t,metrics,history,last,now);
+    let r;if(t.message&&t.messageWebhook===p.id)r=await discord(pub+'/messages/'+t.message,'PATCH',body);
+    if(!r||r.missing)r=await discord(pub+'?wait=true','POST',{...body,username:BRAND,avatar_url:LOGO});
+    if(r.retry)t.publicRetry=r.retry;else if(r.id){t.message=r.id;t.messageWebhook=p.id;t.published=m;t.publishedDisplay=display;}
+  }catch{console.log('DISCORD_STATUS_ERROR');}}
+  await save();
+}
+
+
+export function card(display,status,recovery,m,t,metrics,history,last,now){
+  const labels={monitoring:'🔵 MONITORING ONLY',online:'🟢 WHALLEYBOT ONLINE',offline:'🔴 WHALLEYBOT OFFLINE',unknown:'🟣 MONITORING ERROR',suspended:'⚪ WHALLEYBOT SUSPENDED',verifying:'🟡 VERIFYING STATUS',recovering:'🟠 AUTOMATIC RECOVERY IN PROGRESS',intervention:'🔴 ADMINISTRATOR INTERVENTION REQUIRED'};
+  const colors={monitoring:0x3498db,online:0x2ecc71,offline:0xe74c3c,unknown:0x9b59b6,suspended:0x95a5a6,verifying:0xf1c40f,recovering:0xe67e22,intervention:0xe74c3c};
+  const rule='━━━━━━━━━━━━━━━━━━━━';
+  const names=['Last 24 Hours','Last 7 Days','Last 30 Days','Lifetime'];
+  const lines=metrics.map((x,i)=>`**${names[i]}:** ${x.known?(100*x.online/x.known).toFixed(2)+'%':'N/A'} Available | ${x.outages} ${x.outages===1?'Outage':'Outages'} | ${x.recovered} ${x.recovered===1?'Recovery':'Recoveries'}`);
+  const life=metrics[3];
+  const description=[`**Current Uptime:** ${status==='online'?duration((m-t.onlineSince+1)*MIN):'N/A'}`,`**Last Verified:** ${new Date(now).toISOString().slice(0,16).replace('T',' ')} UTC`,`**Automatic Recovery:** ${recovery?'Enabled':'Disabled'}`,rule,'**📊 SERVICE RELIABILITY**',...lines,rule,`**Monitoring History:** ${duration(life.span*MIN)}`,`**Lifetime Monitoring Coverage:** ${life.span?(100*Math.min(1,life.known/life.span)).toFixed(1)+'%':'N/A'}`,`**Last Outage:** ${history.last_outage==null?'None recorded':`<t:${Math.floor(history.last_outage/1000)}:D>`}`,`**Last Recovery Duration:** ${duration(last?.elapsed)}`,`**Average Recovery Duration:** ${duration(history.avg_recovery)}`,rule,`[Get the Watchdog for your server](${REPO}) • v1.1 • Powered by Cloudflare • [Get WhalleyBot](https://whalleybot.com/)`].join('\n');
+  return {embeds:[{author:{name:BRAND},title:labels[display],description,color:colors[display],thumbnail:{url:LOGO},footer:{text:'Observed process status • Availability based on known samples'}}],allowed_mentions:{parse:[]}};
+}
